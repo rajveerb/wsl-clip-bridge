@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+# wsl-clip-bridge — WSL-side daemon that pipes from clip-listener.exe to wl-copy.
+#
+# The Windows-side listener (clip-listener.exe) reacts to WM_CLIPBOARDUPDATE,
+# saves a PNG, and emits "IMAGE <path>" on stdout. This script reads those
+# lines and pushes each image onto the Wayland clipboard as image/png so
+# Ctrl+V works in apps that read the system clipboard (e.g. Claude Code).
+#
+# Usage:
+#   wsl-clip-bridge              start (run in foreground)
+#   wsl-clip-bridge --stop       kill the listener via taskkill.exe
+#   wsl-clip-bridge --status     check whether the listener is running
+#   wsl-clip-bridge --help
+
+set -euo pipefail
+
+LINUX_OUT="${WSL_CLIP_OUT:-$HOME/.cache/wsl-clip-bridge}"
+LISTENER_EXE="${WSL_CLIP_BRIDGE_EXE:-$HOME/.local/share/wsl-clip-bridge/clip-listener.exe}"
+LOG_FILE="${WSL_CLIP_LOG:-$HOME/.cache/wsl-clip-bridge/bridge.log}"
+
+case "${1:-}" in
+    --stop|stop)
+        if ! command -v taskkill.exe >/dev/null 2>&1; then
+            echo "taskkill.exe not found — is WSL interop enabled?" >&2
+            exit 1
+        fi
+        taskkill.exe /IM clip-listener.exe /F 2>/dev/null \
+            && echo "stopped" \
+            || echo "no clip-listener.exe running"
+        exit 0
+        ;;
+    --status|status)
+        if ! command -v tasklist.exe >/dev/null 2>&1; then
+            echo "tasklist.exe not found — is WSL interop enabled?" >&2
+            exit 1
+        fi
+        if tasklist.exe /FI "IMAGENAME eq clip-listener.exe" 2>/dev/null | grep -q clip-listener.exe; then
+            echo "running"
+        else
+            echo "stopped"
+        fi
+        exit 0
+        ;;
+    --help|-h|help)
+        sed -n '2,/^set -e/p' "$0" | sed -e 's/^# \{0,1\}//' -e '$d'
+        exit 0
+        ;;
+esac
+
+# Prereqs
+for cmd in wl-copy wslpath; do
+    command -v "$cmd" >/dev/null 2>&1 || {
+        echo "$cmd not found" >&2
+        [[ "$cmd" == wl-copy ]] && echo "  install with: sudo apt install wl-clipboard" >&2
+        exit 1
+    }
+done
+[[ -x "$LISTENER_EXE" ]] || {
+    echo "listener not found at $LISTENER_EXE — run install.sh first" >&2
+    exit 1
+}
+
+mkdir -p "$LINUX_OUT" "$(dirname "$LOG_FILE")"
+WIN_OUT="$(wslpath -w "$LINUX_OUT")"
+
+log() { echo "[$(date -Is)] $*" >> "$LOG_FILE"; }
+
+log "starting (linux-out=$LINUX_OUT win-out=$WIN_OUT)"
+
+# reassert: sleep briefly after the initial wl-copy, then re-claim the
+# Wayland selection if WSLg's Windows→Wayland sync has clobbered our
+# image/png back to image/bmp. One single attempt — empirically all that
+# was ever needed; the additional polling we used to do never fired.
+reassert_once() {
+    local path="$1"
+    sleep 0.5
+    [[ -f "$path" ]] || return
+    local types
+    types="$(wl-paste -l 2>/dev/null)"
+    if grep -qx 'image/png' <<<"$types"; then
+        return
+    fi
+    wl-copy --type image/png < "$path" 2>/dev/null
+    log "re-asserted $(basename "$path") (was: $(tr '\n' ',' <<<"$types"))"
+}
+
+# Stdin is closed so the listener does not contend for the tty.
+"$LISTENER_EXE" --win-out "$WIN_OUT" --linux-out "$LINUX_OUT" \
+    < /dev/null 2>>"$LOG_FILE" | \
+while IFS= read -r line; do
+    case "$line" in
+        "IMAGE "*)
+            path="${line#IMAGE }"
+            if [[ -f "$path" ]]; then
+                size="$(stat -c %s "$path" 2>/dev/null || wc -c < "$path")"
+                if wl-copy --type image/png < "$path" 2>>"$LOG_FILE"; then
+                    log "copied $path to wayland clipboard ($size bytes)"
+                    reassert_once "$path" &
+                else
+                    log "wl-copy failed for $path"
+                fi
+            else
+                log "missing file: $path"
+            fi
+            ;;
+        *)
+            log "stdout: $line"
+            ;;
+    esac
+done
+
+log "listener exited"
