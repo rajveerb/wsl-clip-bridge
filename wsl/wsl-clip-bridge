@@ -34,7 +34,8 @@ case "${1:-}" in
             echo "tasklist.exe not found — is WSL interop enabled?" >&2
             exit 1
         fi
-        if tasklist.exe /FI "IMAGENAME eq clip-listener.exe" 2>/dev/null | grep -q clip-listener.exe; then
+        procs="$(tasklist.exe /FI "IMAGENAME eq clip-listener.exe" 2>/dev/null)" || true
+        if [[ "$procs" == *clip-listener.exe* ]]; then
             echo "running"
         else
             echo "stopped"
