@@ -187,8 +187,16 @@ clobber.
 wsl-clip-bridge             # run in foreground (^C stops the bash side)
 wsl-clip-bridge --status    # is clip-listener.exe alive?
 wsl-clip-bridge --stop      # kill it via taskkill.exe
+wsl-clip-bridge --doctor    # check health; auto-repair if broken
 tail -f ~/.cache/wsl-clip-bridge/bridge.log
 ```
+
+If pasting suddenly stops working, `wsl-clip-bridge --doctor` is the one
+command to try. It verifies that exactly one `clip-listener.exe` is
+running and that the latest `starting` line in `bridge.log` has a
+matching `clip-listener started` after it (the symptom that bit before
+the `--status` SIGPIPE fix). On either check failing, it kills the
+listener, spawns a fresh detached wrapper, and re-verifies.
 
 ## Retiring this
 

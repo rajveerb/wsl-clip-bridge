@@ -10,6 +10,7 @@
 #   wsl-clip-bridge              start (run in foreground)
 #   wsl-clip-bridge --stop       kill the listener via taskkill.exe
 #   wsl-clip-bridge --status     check whether the listener is running
+#   wsl-clip-bridge --doctor     check process counts; restart if unhealthy
 #   wsl-clip-bridge --help
 
 set -euo pipefail
@@ -41,6 +42,57 @@ case "${1:-}" in
             echo "stopped"
         fi
         exit 0
+        ;;
+    --doctor|doctor)
+        # A healthy bridge has exactly one clip-listener.exe running (Win32
+        # mutex enforces this) AND the most recent "starting" in the log has
+        # a matching "clip-listener started" after it. The second check
+        # catches the orphaned-wrapper case: a bash wrapper started but its
+        # Go child died on mutex collision, so no "clip-listener started"
+        # ever followed. On unhealthy state, kill the listener (which makes
+        # any orphaned wrapper read EOF and exit) and spawn a fresh detached
+        # bridge.
+        if ! command -v tasklist.exe >/dev/null 2>&1; then
+            echo "tasklist.exe not found — is WSL interop enabled?" >&2
+            exit 1
+        fi
+        check_health() {
+            local procs lc last_start last_ready
+            procs="$(tasklist.exe /FI "IMAGENAME eq clip-listener.exe" 2>/dev/null || true)"
+            # grep -c always prints, but exits 1 with no matches — swallow it.
+            lc="$(grep -c -F 'clip-listener.exe' <<<"$procs" || true)"
+            : "${lc:=0}"
+            printf '  clip-listener.exe: %s (expect 1)\n' "$lc"
+            last_start="$(grep -n 'starting (' "$LOG_FILE" 2>/dev/null | tail -1 | cut -d: -f1 || true)"
+            last_ready="$(grep -n 'clip-listener started' "$LOG_FILE" 2>/dev/null | tail -1 | cut -d: -f1 || true)"
+            : "${last_start:=0}" "${last_ready:=0}"
+            if (( last_start > last_ready )); then
+                printf "  log: last 'starting' (line %s) has no 'clip-listener started' after it\n" "$last_start"
+                return 1
+            fi
+            printf "  log: last 'starting' paired with 'clip-listener started'\n"
+            [[ "$lc" -eq 1 ]]
+        }
+        echo "checking..."
+        if check_health; then
+            echo "healthy"
+            exit 0
+        fi
+        echo "unhealthy — repairing"
+        taskkill.exe /F /IM clip-listener.exe >/dev/null 2>&1 || true
+        sleep 0.5  # let any orphaned wrapper read EOF and exit
+        nohup "$0" >/dev/null 2>&1 &
+        disown
+        # Poll for up to 15s — Go's GDI+ init can take a few seconds on
+        # cold start before it emits "clip-listener started".
+        echo "rechecking..."
+        for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+            sleep 1
+            check_health >/dev/null 2>&1 && { check_health; echo "repaired"; exit 0; }
+        done
+        echo "still unhealthy after repair — check $LOG_FILE" >&2
+        check_health || true
+        exit 1
         ;;
     --help|-h|help)
         sed -n '2,/^set -e/p' "$0" | sed -e 's/^# \{0,1\}//' -e '$d'
